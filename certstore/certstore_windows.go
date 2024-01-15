@@ -64,10 +64,11 @@ const (
 // API will be used.
 //
 // Possible values are:
-//   0x00000000 —                                      — Only use CryptoAPI.
-//   0x00010000 — CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG  — Prefer CryptoAPI.
-//   0x00020000 — CRYPT_ACQUIRE_PREFER_NCRYPT_KEY_FLAG — Prefer CNG.
-//   0x00040000 — CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG   — Only uyse CNG.
+//
+//	0x00000000 —                                      — Only use CryptoAPI.
+//	0x00010000 — CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG  — Prefer CryptoAPI.
+//	0x00020000 — CRYPT_ACQUIRE_PREFER_NCRYPT_KEY_FLAG — Prefer CNG.
+//	0x00040000 — CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG   — Only uyse CNG.
 var winAPIFlag C.DWORD = C.CRYPT_ACQUIRE_PREFER_NCRYPT_KEY_FLAG
 
 // winStore is a wrapper around a C.HCERTSTORE.
@@ -361,14 +362,39 @@ func (wpk *winPrivateKey) Sign(rand io.Reader, digest []byte, opts crypto.Signer
 	if wpk.capiProv != 0 {
 		return wpk.capiSignHash(opts.HashFunc(), digest)
 	} else if wpk.cngHandle != 0 {
-		return wpk.cngSignHash(opts.HashFunc(), digest)
+		return wpk.cngSignHash(opts, digest)
 	} else {
 		return nil, errors.New("bad private key")
 	}
 }
 
 // cngSignHash signs a digest using the CNG APIs.
-func (wpk *winPrivateKey) cngSignHash(hash crypto.Hash, digest []byte) ([]byte, error) {
+func (wpk *winPrivateKey) cngSignHash(opts crypto.SignerOpts, digest []byte) ([]byte, error) {
+
+	/*
+		Cydar upstream change: add support for RSA-PSS signature scheme.
+		Ref: AS-92.
+
+		An incorrect signature value is given when using RSA-PSS and results in
+		an Nginx error during Client cert exchange:
+
+		```
+		*835 SSL_do_handshake() failed (SSL: error:0407E086:rsa
+		routines:RSA_verify_PKCS1_PSS_mgf1:last octet invalid
+		error:1417B07B:SSL routines:tls_process_cert_verify:bad signature)
+		while SSL handshaking.
+		```
+
+		This is because NCryptSignHash would always be given a flag that told
+		it to sign using PKCS1 (`C.BCRYPT_PAD_PKCS1`), despite RSA-PSS being in
+		use.
+
+		This code changes is mostly ported from an existing PR that was opened
+		to the original (now archived) `certstore` repo, but never merged:
+		https://github.com/github/certstore/pull/20/files
+	*/
+
+	hash := opts.HashFunc()
 	if len(digest) != hash.Size() {
 		return nil, errors.New("bad digest for hash")
 	}
@@ -384,23 +410,52 @@ func (wpk *winPrivateKey) cngSignHash(hash crypto.Hash, digest []byte) ([]byte, 
 		sigLen = C.DWORD(0)
 	)
 
-	// setup pkcs1v1.5 padding for RSA
+	// setup pkcs1v1.5/pss padding for RSA
 	if _, isRSA := wpk.publicKey.(*rsa.PublicKey); isRSA {
-		flags |= C.BCRYPT_PAD_PKCS1
-		padInfo := C.BCRYPT_PKCS1_PADDING_INFO{}
-		padPtr = unsafe.Pointer(&padInfo)
+		var pszAlgId C.LPCWSTR
 
+		// get the current hash algorithm identifier:
 		switch hash {
 		case crypto.SHA1:
-			padInfo.pszAlgId = BCRYPT_SHA1_ALGORITHM
+			pszAlgId = BCRYPT_SHA1_ALGORITHM
 		case crypto.SHA256:
-			padInfo.pszAlgId = BCRYPT_SHA256_ALGORITHM
+			pszAlgId = BCRYPT_SHA256_ALGORITHM
 		case crypto.SHA384:
-			padInfo.pszAlgId = BCRYPT_SHA384_ALGORITHM
+			pszAlgId = BCRYPT_SHA384_ALGORITHM
 		case crypto.SHA512:
-			padInfo.pszAlgId = BCRYPT_SHA512_ALGORITHM
+			pszAlgId = BCRYPT_SHA512_ALGORITHM
 		default:
 			return nil, ErrUnsupportedHash
+		}
+
+		// is this using PSS?
+		if pssOpts, ok := opts.(*rsa.PSSOptions); ok {
+			// start logic to create a valid BCRYPT_PSS_PADDING_INFO block:
+
+			// first need to figure out what goes into the cbSalt field:
+			// by default, use the SaltLength provided by the `PSSOptions`
+			saltLength := pssOpts.SaltLength
+			switch saltLength {
+			case rsa.PSSSaltLengthAuto:
+				return nil, ErrUnsupportedHash
+			case rsa.PSSSaltLengthEqualsHash:
+				// in this particular case, take the length of the hash itself:
+				saltLength = hash.Size()
+			}
+			// set the PSS flag
+			flags = C.BCRYPT_PAD_PSS
+			// point `padPtr` to a PSS structure
+			padPtr = unsafe.Pointer(&C.BCRYPT_PSS_PADDING_INFO{
+				pszAlgId: pszAlgId,
+				cbSalt:   C.ulong(saltLength),
+			})
+		} else {
+			// otherwise, not using PSS, so configure as PKCS1:
+			flags = C.BCRYPT_PAD_PKCS1
+			// point `padPtr` to a PKCS1 structure
+			padPtr = unsafe.Pointer(&C.BCRYPT_PKCS1_PADDING_INFO{
+				pszAlgId: pszAlgId,
+			})
 		}
 	}
 
@@ -637,7 +692,16 @@ func (c errCode) Error() string {
 	if cmsg == nil {
 		return fmt.Sprintf("Error %X", int(c))
 	}
-	defer C.LocalFree(C.HLOCAL(cmsg))
+	/*
+		Cydar upstream change: fix compilation on recent Go compiler versions.
+
+		Wrap `cmsg` in an `unsafe.Pointer` before converting to a `C.HLOCAL`:
+
+		This fixes an open issue in the (newer) `certstore` repo, that had an
+		open pull request, but seems to have lost all traction:
+		https://github.com/github/smimesign/pull/114
+	*/
+	defer C.LocalFree(C.HLOCAL(unsafe.Pointer(cmsg)))
 
 	gomsg := C.GoString(cmsg)
 
