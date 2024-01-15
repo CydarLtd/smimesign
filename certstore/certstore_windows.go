@@ -375,7 +375,7 @@ func (wpk *winPrivateKey) cngSignHash(opts crypto.SignerOpts, digest []byte) ([]
 		Cydar upstream change: add support for RSA-PSS signature scheme.
 		Ref: AS-92.
 
-		A garbage SaltLength value is given when using RSA-PSS and results in
+		An incorrect signature value is given when using RSA-PSS and results in
 		an Nginx error during Client cert exchange:
 
 		```
@@ -385,10 +385,9 @@ func (wpk *winPrivateKey) cngSignHash(opts crypto.SignerOpts, digest []byte) ([]
 		while SSL handshaking.
 		```
 
-		This is because the `pPaddingInfo` parameter for `NCryptSignHash` would
-		previously always be given a `BCRYPT_PKCS1_PADDING_INFO` struct, which,
-		when the pointer to it is transferred to C-land and interpreted, would
-		have an invalid `cbSalt` value, since that's for PKCS1 and not PSS.
+		This is because NCryptSignHash would always be given a flag that told
+		it to sign using PKCS1 (`C.BCRYPT_PAD_PKCS1`), despite RSA-PSS being in
+		use.
 
 		This code changes is mostly ported from an existing PR that was opened
 		to the original (now archived) `certstore` repo, but never merged:
@@ -443,7 +442,7 @@ func (wpk *winPrivateKey) cngSignHash(opts crypto.SignerOpts, digest []byte) ([]
 				// in this particular case, take the length of the hash itself:
 				saltLength = hash.Size()
 			}
-			// set the PSS flag to true
+			// set the PSS flag
 			flags = C.BCRYPT_PAD_PSS
 			// point `padPtr` to a PSS structure
 			padPtr = unsafe.Pointer(&C.BCRYPT_PSS_PADDING_INFO{
